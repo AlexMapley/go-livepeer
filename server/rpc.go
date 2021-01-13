@@ -22,6 +22,7 @@ import (
 	"github.com/livepeer/go-livepeer/pm"
 	ffmpeg "github.com/livepeer/lpms/ffmpeg"
 	"github.com/livepeer/lpms/stream"
+	"github.com/patrickmn/go-cache"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -34,6 +35,8 @@ const GRPCConnectTimeout = 3 * time.Second
 const GRPCTimeout = 8 * time.Second
 
 var authTokenValidPeriod = 30 * time.Minute
+
+var discoveryAuthWebhookCache = cache.New(authTokenValidPeriod, authTokenValidPeriod)
 
 type Orchestrator interface {
 	ServiceURI() *url.URL
@@ -255,23 +258,26 @@ func getOrchestrator(orch Orchestrator, req *net.OrchestratorRequest) (*net.Orch
 		return nil, fmt.Errorf("Invalid orchestrator request (%v)", err)
 	}
 
-	webhookRes, err := authenticateBroadcaster(addr.Hex())
-	if err != nil {
+	if _, err := authenticateBroadcaster(addr); err != nil {
 		return nil, fmt.Errorf("authentication failed: %v", err)
 	}
 
 	// currently, orchestrator == transcoder
-	oInfo, err := orchestratorInfo(orch, addr, orch.ServiceURI().String())
-	if err != nil {
-		return nil, err
-	}
+	return orchestratorInfo(orch, addr, orch.ServiceURI().String())
+}
 
-	// Adjust the necessary orchestrator info values
-	return handleWebhookResponse(webhookRes, oInfo), nil
+func getPriceInfo(orch Orchestrator, addr ethcommon.Address) (*net.PriceInfo, error) {
+	if AuthWebhookURL != "" {
+		webhookRes := getFromDiscoveryAuthWebhookCache(addr)
+		if webhookRes != nil && webhookRes.PriceInfo != nil {
+			return webhookRes.PriceInfo, nil
+		}
+	}
+	return orch.PriceInfo(addr)
 }
 
 func orchestratorInfo(orch Orchestrator, addr ethcommon.Address, serviceURI string) (*net.OrchestratorInfo, error) {
-	priceInfo, err := orch.PriceInfo(addr)
+	priceInfo, err := getPriceInfo(orch, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -316,15 +322,18 @@ func verifyOrchestratorReq(orch Orchestrator, addr ethcommon.Address, sig []byte
 	return orch.CheckCapacity("")
 }
 
-type authBroadcasterResponse struct{}
+type discoveryAuthWebhookRes struct {
+	PriceInfo *net.PriceInfo `json:"price,omitempty"`
+}
 
 // authenticateBroadcaster returns an error if authentication fails
-func authenticateBroadcaster(id string) (*authBroadcasterResponse, error) {
+// on success it caches the webhook response
+func authenticateBroadcaster(addr ethcommon.Address) (*discoveryAuthWebhookRes, error) {
 	if AuthWebhookURL == "" {
 		return nil, nil
 	}
 
-	values := map[string]string{"id": id}
+	values := map[string]string{"id": addr.Hex()}
 	jsonValues, err := json.Marshal(values)
 	if err != nil {
 		return nil, err
@@ -344,17 +353,36 @@ func authenticateBroadcaster(id string) (*authBroadcasterResponse, error) {
 		return nil, errors.New(string(body))
 	}
 
-	webhookRes := &authBroadcasterResponse{}
+	webhookRes := &discoveryAuthWebhookRes{}
 	if err := json.Unmarshal(body, webhookRes); err != nil {
 		return nil, err
 	}
 
+	addToDiscoveryAuthWebhookCache(addr, webhookRes, authTokenValidPeriod)
+
 	return webhookRes, nil
 }
 
-func handleWebhookResponse(res *authBroadcasterResponse, oInfo *net.OrchestratorInfo) *net.OrchestratorInfo {
-	// handleWebhookResponse modifies the orchestrator info object returned to the broadcaster based on the webhook response
-	return oInfo
+func addToDiscoveryAuthWebhookCache(addr ethcommon.Address, webhookRes *discoveryAuthWebhookRes, expiration time.Duration) {
+	id := addr.Hex()
+	_, ok := discoveryAuthWebhookCache.Get(id)
+	if ok {
+		discoveryAuthWebhookCache.Replace(id, webhookRes, authTokenValidPeriod)
+	} else {
+		discoveryAuthWebhookCache.Add(id, webhookRes, authTokenValidPeriod)
+	}
+}
+
+func getFromDiscoveryAuthWebhookCache(addr ethcommon.Address) *discoveryAuthWebhookRes {
+	c, ok := discoveryAuthWebhookCache.Get(addr.Hex())
+	if !ok {
+		return nil
+	}
+	webhookRes, ok := c.(*discoveryAuthWebhookRes)
+	if !ok {
+		return nil
+	}
+	return webhookRes
 }
 
 func pmTicketParams(params *net.TicketParams) *pm.TicketParams {
